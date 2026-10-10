@@ -86,3 +86,7 @@ Built with PySide6, sounddevice, NumPy and pycaw.
 
 Audy was previously called Standby Preventer. On first run it imports that app's settings and
 replaces its startup entry.
+
+## License
+
+[MIT](LICENSE)
