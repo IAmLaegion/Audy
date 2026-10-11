@@ -11,6 +11,8 @@ from . import audio, config, platform_win
 
 TICK_MS = 250
 METER_EVERY_S = 0.5
+RESCAN_EVERY_S = 60  # look for disconnected speakers coming back
+RETRY_AFTER_S = 60  # wait before retrying a speaker that couldn't be reached
 ACTIVITY_THRESHOLD = 0.003  # linear peak; our own pulse is suppressed separately
 MAX_EVENTS = 60
 
@@ -67,8 +69,13 @@ class Engine(QObject):
         self.pulses_today = 0
         self.skips_today = 0
         self._day = datetime.now().date()
-        self._next_due = None
-        self._cycle_start = None
+        # Each speaker has its own silence timer: it gets a pulse once it has heard nothing
+        # (no audio, no pulse) for a full interval. Timing from the last sound, not from the
+        # last check, means a skipped pulse can't leave a speaker silent for two intervals.
+        self._baseline = None  # treated as the last pulse for speakers not pulsed yet
+        self._last_pulse = {}
+        self._skip_noted = {}
+        self._last_rescan = 0.0
         self._playing = False
         self._was_outside = False
         self._suppress_meter_until = 0.0
@@ -106,17 +113,24 @@ class Engine(QObject):
     def meter_available(self):
         return self._meter.available
 
-    def seconds_until_next(self):
-        if self.state != RUNNING or self._next_due is None:
+    def _soonest(self):
+        """(quiet_since, due_at) for the speaker that needs a pulse soonest, or None."""
+        if self.state != RUNNING or self._baseline is None or not self.targets:
             return None
-        return max(0.0, self._next_due - time.monotonic())
+        return min(((self._quiet_since(n), self._due_at(n)) for n in self.targets), key=lambda x: x[1])
+
+    def seconds_until_next(self):
+        soonest = self._soonest()
+        if soonest is None:
+            return None
+        return max(0.0, soonest[1] - time.monotonic())
 
     def cycle_progress(self):
         """0..1 through the current interval, for the dial's ring."""
-        if self.state != RUNNING or self._next_due is None or self._cycle_start is None:
+        soonest = self._soonest()
+        if soonest is None:
             return 0.0
-        span = max(1e-6, self._next_due - self._cycle_start)
-        return min(1.0, max(0.0, (time.monotonic() - self._cycle_start) / span))
+        return min(1.0, max(0.0, (time.monotonic() - soonest[0]) / self.interval_s))
 
     def next_window_start(self):
         return _parse_hhmm(self.settings["active_from"])
@@ -128,7 +142,7 @@ class Engine(QObject):
         self.paused_until = None
         self.running_since = time.monotonic()
         self._was_outside = not self._within_hours(datetime.now())
-        self._schedule(now=True)  # wake the speakers straight away
+        self._schedule(now=True)  # wake the speakers straight away, unless audio is already playing
         self._log("info", "Keepalive started")
         for name in self.missing:
             self._log("error", f"{short_name(name)} isn't connected")
@@ -142,7 +156,7 @@ class Engine(QObject):
         self.active = False
         self.paused_until = None
         self.running_since = None
-        self._next_due = None
+        self._baseline = None
         self._log("info", "Keepalive stopped")
         self._apply_keep_awake()
         self._persist_running()
@@ -184,9 +198,7 @@ class Engine(QObject):
         self.settings = settings
         if devices_changed:
             self.refresh_devices()
-        if timing_changed and self.state == RUNNING and self._cycle_start is not None:
-            # Keep the elapsed part of the current cycle, apply the new length.
-            self._next_due = self._cycle_start + self.interval_s
+        # A new interval needs nothing here: due times are worked out from it on every tick.
         self._apply_keep_awake()
         self.changed.emit()
 
@@ -209,9 +221,38 @@ class Engine(QObject):
         return t >= start or t < end
 
     def _schedule(self, now=False):
+        """Restart every speaker's timer: due immediately with now=True, else one interval from now."""
         m = time.monotonic()
-        self._cycle_start = m
-        self._next_due = m if now else m + self.interval_s
+        self._baseline = m - self.interval_s if now else m
+        self._last_pulse = {}
+        self._skip_noted = {}
+
+    def _heard_audio(self):
+        return self.settings["skip_when_playing"] and self._meter.available
+
+    def _quiet_since(self, name):
+        last = self._last_pulse.get(name, self._baseline)
+        if self._heard_audio():
+            last = max(last, self._last_activity.get(name, -1e9))
+        return last
+
+    def _due_at(self, name):
+        return self._quiet_since(name) + self.interval_s
+
+    def _note_skips(self, m):
+        """Log once each time audio that was already playing pushed a speaker's pulse back."""
+        if not self._heard_audio():
+            return
+        held = []
+        for name in self.targets:
+            pulsed = self._last_pulse.get(name, self._baseline)
+            if pulsed + self.interval_s <= m < self._due_at(name) and self._skip_noted.get(name) != pulsed:
+                self._skip_noted[name] = pulsed
+                held.append(name)
+        if held:
+            self._log("skip", f"Skipped {', '.join(short_name(n) for n in held)}: audio already playing")
+            self.skips_today += 1
+            self.changed.emit()
 
     def _apply_keep_awake(self):
         platform_win.set_keep_awake(self.active and self.settings["keep_pc_awake"])
@@ -271,14 +312,18 @@ class Engine(QObject):
         if outside:
             return
 
-        if self._next_due is not None and m >= self._next_due and not self._playing:
+        if self._playing:
+            return
+        if self.missing and m - self._last_rescan >= RESCAN_EVERY_S:
+            self._last_rescan = m
+            self.refresh_devices()
+        self._note_skips(m)
+        if any(m >= self._due_at(n) for n in self.targets):
             self._pulse(manual=False)
 
     def _pulse(self, manual):
         m = time.monotonic()
-        if not manual or self.state == RUNNING:
-            self._schedule()
-
+        self._last_rescan = m
         previously_missing = set(self.missing)
         resolved, self.missing = audio.resolve(self.settings["devices"], rescan=True)
         self.targets = [d["name"] for d in resolved]
@@ -288,16 +333,10 @@ class Engine(QObject):
             if manual or name not in previously_missing:
                 self._log("error", f"{short_name(name)} isn't connected")
 
-        to_play = resolved
-        if not manual and self.settings["skip_when_playing"] and self._meter.available:
-            busy = [
-                d for d in resolved if m - self._last_activity.get(d["name"], -1e9) < self.interval_s
-            ]
-            if busy:
-                names = ", ".join(short_name(d["name"]) for d in busy)
-                self._log("skip", f"Skipped {names}: audio already playing")
-                self.skips_today += 1
-            to_play = [d for d in resolved if d not in busy]
+        if manual or self._baseline is None:
+            to_play = resolved  # a test pulse goes everywhere
+        else:
+            to_play = [d for d in resolved if m >= self._due_at(d["name"])]
 
         if not to_play:
             self.changed.emit()
@@ -320,6 +359,12 @@ class Engine(QObject):
 
     def _on_played(self, ok, errors, manual):
         self._playing = False
+        m = time.monotonic()
+        for name in ok:
+            self._last_pulse[name] = m
+        for name in errors:
+            # Try again in a minute rather than on every tick.
+            self._last_pulse[name] = m - self.interval_s + RETRY_AFTER_S
         if ok:
             names = ", ".join(short_name(n) for n in ok)
             self._log("pulse", f"{'Test pulse' if manual else 'Pulse'} sent to {names}")
